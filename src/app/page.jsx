@@ -88,7 +88,7 @@ export default function Home() {
 
       // Trim conversation to fit within a token budget.
       // Send recent messages that fit under MAX_API_CHARS total.
-      const MAX_API_CHARS = 8000;
+      const MAX_API_CHARS = 4000;
       const allMapped = updatedMessages.map(msg => ({
         role: msg.type === "user" ? "user" : "assistant",
         content: msg.rawText || msg.text || ""

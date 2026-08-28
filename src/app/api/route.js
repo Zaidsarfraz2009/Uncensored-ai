@@ -127,8 +127,11 @@ function getRedis() {
 }
 
 // ── Input limits ──
-const MAX_INPUT_CHARS = 4000;       // max characters for a single prompt
-const MAX_MESSAGES_TOTAL = 12000;   // max total characters across all messages in a conversation
+const MAX_INPUT_CHARS = 2000;       // max characters for a single prompt
+const MAX_MESSAGES_TOTAL = 6000;    // max total characters across all messages in a conversation
+
+// ── Turnstile Session Duration (24 hours) ──
+const TURNSTILE_SESSION_TTL = 86400; // 24 hours in seconds
 
 // ── Rate limiter (5 requests / minute per IP) ──
 let _ratelimit = null;
@@ -142,64 +145,74 @@ function getRateLimiter() {
     return _ratelimit;
 }
 
-// ── Daily per-IP cap (200 requests/day) ──
-const DAILY_REQUEST_LIMIT = 200;
+// ── In-Memory Rate Limiting Fallback (if Redis is not configured or offline) ──
+const memoryRateLimitMap = new Map();
+const MEMORY_WINDOW_MS = 60 * 1000; // 1 minute
+const MEMORY_MAX_REQS = 5;
+
+function checkMemoryRateLimit(ip) {
+    const now = Date.now();
+    const record = memoryRateLimitMap.get(ip);
+
+    // Clean up old entries periodically if map grows
+    if (memoryRateLimitMap.size > 10000) {
+        for (const [key, val] of memoryRateLimitMap.entries()) {
+            if (now - val.startTime > MEMORY_WINDOW_MS) {
+                memoryRateLimitMap.delete(key);
+            }
+        }
+    }
+
+    if (!record || now - record.startTime > MEMORY_WINDOW_MS) {
+        memoryRateLimitMap.set(ip, { count: 1, startTime: now });
+        return { success: true, remaining: MEMORY_MAX_REQS - 1 };
+    }
+
+    if (record.count >= MEMORY_MAX_REQS) {
+        return { success: false, remaining: 0 };
+    }
+
+    record.count += 1;
+    return { success: true, remaining: MEMORY_MAX_REQS - record.count };
+}
+
+// ── Daily per-IP cap (50 requests/day) ──
+const DAILY_REQUEST_LIMIT = 50;
 const DAILY_REQUEST_WINDOW = 86400; // 24 hours in seconds
 
 async function checkDailyCap(ip) {
     const redis = getRedis();
     if (!redis) return { allowed: true };
     const key = `daily:${ip}`;
-    const count = await redis.incr(key);
-    if (count === 1) {
-        await redis.expire(key, DAILY_REQUEST_WINDOW);
+    try {
+        const count = await redis.incr(key);
+        if (count === 1) {
+            await redis.expire(key, DAILY_REQUEST_WINDOW);
+        }
+        if (count > DAILY_REQUEST_LIMIT) {
+            return { allowed: false, remaining: 0 };
+        }
+        return { allowed: true, remaining: DAILY_REQUEST_LIMIT - count };
+    } catch (e) {
+        console.error('[DAILY CAP ERROR]', e?.message || e);
+        return { allowed: true };
     }
-    if (count > DAILY_REQUEST_LIMIT) {
-        return { allowed: false, remaining: 0 };
-    }
-    return { allowed: true, remaining: DAILY_REQUEST_LIMIT - count };
 }
 
-function isLoopbackHost(hostname) {
-    if (!hostname) return false;
-    return hostname === 'localhost'
-        || hostname === '127.0.0.1'
-        || hostname === '::1'
-        || hostname === '[::1]';
+// Check if running in a safe local development environment.
+// NEVER trust client-supplied headers (Host, Origin, X-Forwarded-Host) in production.
+function isDevelopmentEnvironment() {
+    return process.env.NODE_ENV === 'development';
 }
 
-function isLocalRequest(request) {
-    const url = new URL(request.url);
-    const hostHeader = request.headers.get('host');
-    const originHeader = request.headers.get('origin');
-    const forwardedHost = request.headers.get('x-forwarded-host');
-
-    const candidates = [url.hostname, hostHeader, forwardedHost]
-        .flatMap((value) => (value ? value.split(',') : []))
-        .map((value) => value.trim())
-        .map((value) => {
-            if (value.startsWith('[')) {
-                return value.slice(1, value.indexOf(']') > -1 ? value.indexOf(']') : undefined);
-            }
-            const lastColon = value.lastIndexOf(':');
-            if (lastColon > -1 && value.indexOf(':') === lastColon) {
-                return value.slice(0, lastColon);
-            }
-            return value;
-        });
-
-    for (const candidate of candidates) {
-        if (isLoopbackHost(candidate)) return true;
-    }
-
-    if (originHeader) {
-        try {
-            const originHost = new URL(originHeader).hostname;
-            if (isLoopbackHost(originHost)) return true;
-        } catch { }
-    }
-
-    return false;
+function extractClientIp(request) {
+    return (
+        request.headers.get("cf-connecting-ip") ||
+        request.headers.get("x-real-ip") ||
+        (request.headers.get("x-forwarded-for") || "").split(",")[0].trim() ||
+        request.ip ||
+        "127.0.0.1"
+    );
 }
 
 // =========================
@@ -374,6 +387,8 @@ async function generateCode(input) {
 // =========================
 async function handleRequest(request) {
     let result = "";
+    const isDev = isDevelopmentEnvironment();
+    const rawIp = extractClientIp(request);
 
     if (request.method === "POST") {
         try {
@@ -389,8 +404,7 @@ async function handleRequest(request) {
             }
 
             // 1. Session & Turnstile Verification
-            // Only enforce Turnstile when the request is not coming from loopback.
-            const needsTurnstile = process.env.TURNSTILE_SECRET_KEY && !isLocalRequest(request);
+            const needsTurnstile = Boolean(process.env.TURNSTILE_SECRET_KEY) && !isDev;
             if (needsTurnstile) {
                 const cookieStore = await cookies();
                 const sessionId = cookieStore.get('cf_verified')?.value;
@@ -399,21 +413,25 @@ async function handleRequest(request) {
                 if (sessionId) {
                     const redis = getRedis();
                     if (redis) {
-                        const valid = await redis.get(`session:${sessionId}`);
-                        if (valid) isVerified = true;
+                        try {
+                            const valid = await redis.get(`session:${sessionId}`);
+                            if (valid) isVerified = true;
+                        } catch (e) {
+                            console.error('[SESSION REDIS ERROR]', e?.message || e);
+                        }
                     }
                 }
 
                 if (!isVerified) {
                     const token = body.turnstileToken;
-                    if (!token) return new NextResponse("Verification required. Please wait for the security check to complete.", { status: 403 });
+                    if (!token) return new NextResponse("Verification required. Please complete the security check.", { status: 403 });
 
                     const verifyRes = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
                         method: "POST",
                         headers: {
                             "Content-Type": "application/x-www-form-urlencoded",
                         },
-                        body: `secret=${process.env.TURNSTILE_SECRET_KEY}&response=${token}`,
+                        body: `secret=${encodeURIComponent(process.env.TURNSTILE_SECRET_KEY)}&response=${encodeURIComponent(token)}&remoteip=${encodeURIComponent(rawIp)}`,
                     });
 
                     const verifyData = await verifyRes.json();
@@ -421,39 +439,43 @@ async function handleRequest(request) {
                         return new NextResponse("Verification failed. Please refresh the page and try again.", { status: 403 });
                     }
 
-                    // Issue a new session valid for 1 hour
+                    // Issue a new session valid for 24 hours
                     newSessionId = crypto.randomUUID();
                     const redis = getRedis();
                     if (redis) {
-                        await redis.set(`session:${newSessionId}`, "1", { ex: 3600 });
+                        try {
+                            await redis.set(`session:${newSessionId}`, "1", { ex: TURNSTILE_SESSION_TTL });
+                        } catch (e) {
+                            console.error('[REDIS SET SESSION ERROR]', e?.message || e);
+                        }
                     }
                 }
             }
 
             let rlResult = null;
-            let rawIp = "unknown";
 
-            // 2. Upstash Redis Rate Limiting
-            const ratelimit = getRateLimiter();
-            if (ratelimit) {
-                // cf-connecting-ip is set by Cloudflare and is always the real client IP
-                // x-forwarded-for can be a comma-separated list; take only the first entry
-                rawIp =
-                    request.headers.get("cf-connecting-ip") ||
-                    (request.headers.get("x-forwarded-for") || "").split(",")[0].trim() ||
-                    request.ip ||
-                    "unknown";
-                if (!isLocalRequest(request)) {
-                    rlResult = await ratelimit.limit(rawIp);
-                    if (!rlResult.success) {
-                        return new NextResponse("You're sending messages too fast! Please wait a moment before trying again.", { status: 429 });
+            // 2. Rate Limiting (Redis with In-Memory fallback)
+            if (!isDev) {
+                const ratelimit = getRateLimiter();
+                if (ratelimit) {
+                    try {
+                        rlResult = await ratelimit.limit(rawIp);
+                    } catch (e) {
+                        console.error('[REDIS RATELIMIT ERROR, FALLING BACK TO MEMORY]', e?.message || e);
+                        rlResult = checkMemoryRateLimit(rawIp);
                     }
+                } else {
+                    rlResult = checkMemoryRateLimit(rawIp);
+                }
 
-                    // 3. Daily per-IP cap
-                    const dailyCap = await checkDailyCap(rawIp);
-                    if (!dailyCap.allowed) {
-                        return new NextResponse("You've reached your daily limit. Come back tomorrow for more conversations!", { status: 429 });
-                    }
+                if (rlResult && !rlResult.success) {
+                    return new NextResponse("You're sending messages too fast! Please wait a moment before trying again.", { status: 429 });
+                }
+
+                // 3. Daily per-IP cap
+                const dailyCap = await checkDailyCap(rawIp);
+                if (!dailyCap.allowed) {
+                    return new NextResponse("You've reached your daily limit. Come back tomorrow for more conversations!", { status: 429 });
                 }
             }
 
@@ -466,13 +488,13 @@ async function handleRequest(request) {
                     "Transfer-Encoding": "chunked",
                 };
 
-                if (rlResult) {
+                if (rlResult && rlResult.remaining !== undefined) {
                     headers["X-RateLimit-IP"] = rawIp;
                     headers["X-RateLimit-Remaining"] = rlResult.remaining.toString();
                 }
 
                 if (newSessionId) {
-                    headers["Set-Cookie"] = `cf_verified=${newSessionId}; HttpOnly; Path=/; Max-Age=${3600}${isLocalRequest(request) ? '' : '; Secure'}`;
+                    headers["Set-Cookie"] = `cf_verified=${newSessionId}; HttpOnly; Path=/; Max-Age=${TURNSTILE_SESSION_TTL}; SameSite=Lax${isDev ? '' : '; Secure'}`;
                 }
                 return new Response(readableStream, { status: 200, headers });
             }
@@ -495,7 +517,7 @@ async function handleRequest(request) {
     }
 
     // ── Gate GET behind the same security as POST ──
-    const needsTurnstileGet = process.env.TURNSTILE_SECRET_KEY && !isLocalRequest(request);
+    const needsTurnstileGet = Boolean(process.env.TURNSTILE_SECRET_KEY) && !isDev;
     if (needsTurnstileGet) {
         const cookieStoreGet = await cookies();
         const sessionIdGet = cookieStoreGet.get('cf_verified')?.value;
@@ -504,32 +526,41 @@ async function handleRequest(request) {
         if (sessionIdGet) {
             const redis = getRedis();
             if (redis) {
-                const valid = await redis.get(`session:${sessionIdGet}`);
-                if (valid) isVerifiedGet = true;
+                try {
+                    const valid = await redis.get(`session:${sessionIdGet}`);
+                    if (valid) isVerifiedGet = true;
+                } catch (e) {
+                    console.error('[GET REDIS SESSION ERROR]', e?.message || e);
+                }
             }
         }
 
         if (!isVerifiedGet) {
-            return new NextResponse("Your session has expired. Please refresh the page to continue chatting.", { status: 403 });
+            return new NextResponse("Your session has expired or verification is required. Please open the chat page to verify.", { status: 403 });
         }
     }
 
     // Rate-limit GET requests the same way as POST
-    let rlResultGet = null;
-    const ratelimitGet = getRateLimiter();
-    if (ratelimitGet && !isLocalRequest(request)) {
-        const rawIpGet =
-            request.headers.get("cf-connecting-ip") ||
-            (request.headers.get("x-forwarded-for") || "").split(",")[0].trim() ||
-            request.ip ||
-            "unknown";
-        rlResultGet = await ratelimitGet.limit(rawIpGet);
-        if (!rlResultGet.success) {
-            return new NextResponse("You're sending messages too fast! Please wait a moment before trying again.", { status: 429 });
+    if (!isDev) {
+        let rlResultGet = null;
+        const ratelimitGet = getRateLimiter();
+        if (ratelimitGet) {
+            try {
+                rlResultGet = await ratelimitGet.limit(rawIp);
+            } catch (e) {
+                console.error('[GET REDIS RATELIMIT ERROR, FALLING BACK TO MEMORY]', e?.message || e);
+                rlResultGet = checkMemoryRateLimit(rawIp);
+            }
+        } else {
+            rlResultGet = checkMemoryRateLimit(rawIp);
+        }
+
+        if (rlResultGet && !rlResultGet.success) {
+            return new NextResponse("You're sending requests too fast! Please wait a moment before trying again.", { status: 429 });
         }
 
         // Daily per-IP cap for GET
-        const dailyCapGet = await checkDailyCap(rawIpGet);
+        const dailyCapGet = await checkDailyCap(rawIp);
         if (!dailyCapGet.allowed) {
             return new NextResponse("You've reached your daily limit. Come back tomorrow for more conversations!", { status: 429 });
         }
