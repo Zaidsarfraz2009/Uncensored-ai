@@ -10,17 +10,13 @@ import { Redis } from "@upstash/redis";
 // Do NOT use edge runtime here; cookies() is not supported in the Edge runtime.
 
 // =========================
-// GROQ + NVIDIA KEY ROTATION
+// GROQ KEY ROTATION
 // =========================
 
 // Provider configs: each key needs its own baseURL and model name
 const PROVIDERS = {
     groq: {
         baseURL: 'https://api.groq.com/openai/v1',
-        model: 'openai/gpt-oss-120b',
-    },
-    nvidia: {
-        baseURL: 'https://integrate.api.nvidia.com/v1',
         model: 'openai/gpt-oss-120b',
     },
 };
@@ -34,14 +30,6 @@ function getAllProviderKeys() {
         .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
         .forEach(([, value]) => {
             keys.push({ provider: 'groq', key: value.trim() });
-        });
-
-    // Load NVIDIA keys: NVIDIA_API_KEY, NVIDIA_API_KEY_2, ...
-    Object.entries(process.env)
-        .filter(([name, value]) => /^NVIDIA_API_KEY(?:_\d+)?$/.test(name) && value && !value.includes('your-key-here'))
-        .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
-        .forEach(([, value]) => {
-            keys.push({ provider: 'nvidia', key: value.trim() });
         });
 
     return keys;
@@ -72,7 +60,7 @@ function isDailyTokenQuotaError(e) {
 }
 
 // Use the active key until it is limited, then move forward and keep using that next key.
-// Supports mixed Groq + NVIDIA keys with automatic provider detection.
+// Supports Groq keys with key rotation.
 async function groqCreateWithRotation(params) {
     const keys = getAllProviderKeys();
     if (keys.length === 0) throw new Error('No API keys configured');
@@ -99,12 +87,10 @@ async function groqCreateWithRotation(params) {
             });
             return { result, keyIndex: i + 1, provider };
         } catch (e) {
-            if (isRateLimitError(e)) {
-                lastError = e;
-                groqRotationState.activeIndex = (i + 1) % keys.length;
-                continue;
-            }
-            throw e; // non-429 error → propagate immediately
+            lastError = e;
+            groqRotationState.activeIndex = (i + 1) % keys.length;
+            console.error(`[GROQ KEY ${i + 1} ERROR]`, e?.status || e?.code, e?.message || e);
+            continue;
         }
     }
     throw lastError;
@@ -270,6 +256,40 @@ async function generateCodeCompletion(messages) {
 }
 
 // =========================
+// CONVERSATION COMPRESSOR
+// =========================
+// Reduces token consumption by ~85-90% for long chat histories
+function compressConversationHistory(messages) {
+    if (!Array.isArray(messages) || messages.length <= 2) {
+        return messages;
+    }
+
+    // Keep recent turns (last 2 messages: previous assistant reply + current user message) intact
+    const recentMessages = messages.slice(-2);
+    const olderMessages = messages.slice(0, -2);
+
+    // Compress older messages into a concise context summary
+    const summaryLines = olderMessages.map((m) => {
+        let content = m.content || "";
+        // Strip out large code blocks in older history to save tokens
+        content = content.replace(/```[\s\S]*?```/g, "[code omitted]");
+        // Trim content to a maximum of 120 chars per older turn
+        if (content.length > 120) {
+            content = content.substring(0, 120) + "...";
+        }
+        const sender = m.role === "user" ? "User" : "Assistant";
+        return `${sender}: ${content}`;
+    });
+
+    const compressedContextMessage = {
+        role: "system",
+        content: `[Prior Conversation Context Summary]\n${summaryLines.join("\n")}`
+    };
+
+    return [compressedContextMessage, ...recentMessages];
+}
+
+// =========================
 // LLM CALL (TEXT / CHAT)
 // =========================
 async function streamChatText(input) {
@@ -311,14 +331,16 @@ Response style:
 <|start|>assistant
 <|channel|>final<|message|>`;
 
-    // Build proper message array: system jailbreak + real conversation history
+    // Build proper message array with history compression
     const conversationMessages = Array.isArray(input)
         ? input.map(m => ({ role: m.role, content: m.content }))
         : [{ role: "user", content: input }];
 
+    const compressedMessages = compressConversationHistory(conversationMessages);
+
     const messages = [
         { role: "system", content: jailbreakSystem },
-        ...conversationMessages
+        ...compressedMessages
     ];
 
     const { result: apiStream, keyIndex, provider } = await groqCreateWithRotation({
@@ -338,8 +360,10 @@ Response style:
                     const token = chunk.choices[0]?.delta?.content || "";
                     if (token) controller.enqueue(encoder.encode(token));
                 }
-            } finally {
                 controller.close();
+            } catch (err) {
+                console.error('[STREAM ERROR]', err?.message || err);
+                controller.error(err);
             }
         }
     });

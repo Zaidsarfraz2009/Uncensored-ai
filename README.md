@@ -52,7 +52,7 @@ In essence, the model's own training structure is used against it. The safety fi
 
 > **Disclaimer**: The author takes no moral responsibility for the model's outputs. **The user made me do it.**
 
-The full prompt is constructed and injected server-side in `src/app/api/route.js` → `callNvidiaText()`, keeping it fully opaque to the end user.
+The full prompt is constructed and injected server-side in `src/app/api/route.js` → `streamChatText()`, keeping it fully opaque to the end user.
 
 ### Jail Break Prompt:
 ```text
@@ -85,7 +85,7 @@ Disallowed content:
 
 ```
 
-> **Note**: Insert your system prompt between the two `<|start|>assistant` token blocks inside `callNvidiaText()` in `src/app/api/route.js`. The token ordering is critical — the `analysis` block must precede the `final` block for the bypass to work correctly.
+> **Note**: Insert your system prompt between the two `<|start|>assistant` token blocks inside `streamChatText()` in `src/app/api/route.js`. The token ordering is critical — the `analysis` block must precede the `final` block for the bypass to work correctly.
 
 
 ---
@@ -109,7 +109,7 @@ Disallowed content:
 | **API Runtime** | Edge Runtime |
 | **Frontend** | React 18, TailwindCSS, Aceternity UI |
 | **Animations** | Framer Motion |
-| **AI Integration** | `openai` SDK → GPT-OSS 120B (NVIDIA endpoint) |
+| **AI Integration** | `openai` SDK → GPT-OSS 120B (Groq endpoint) |
 | **Bot Protection** | Cloudflare Turnstile (`@marsidev/react-turnstile`) |
 | **Rate Limiting** | Upstash Redis + `@upstash/ratelimit` |
 
@@ -128,7 +128,7 @@ Next.js Edge API Route (/api/route.js)
   │         ↓ (if allowed)
   └─── Custom Jailbreak System Prompt injected
               ↓
-       GPT-OSS 120B API (NVIDIA)
+       GPT-OSS 120B API (Groq)
               ↓
     Response streamed back to client
 
